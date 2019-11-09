@@ -85,13 +85,6 @@ THREE.EXRLoader.prototype = Object.assign( Object.create( THREE.DataTextureLoade
 
 	constructor: THREE.EXRLoader,
 
-	setDataType: function ( value ) {
-
-		this.type = value;
-		return this;
-
-	},
-
 	parse: function ( buffer ) {
 
 		const USHORT_RANGE = ( 1 << 16 );
@@ -769,6 +762,71 @@ THREE.EXRLoader.prototype = Object.assign( Object.create( THREE.DataTextureLoade
 
 		}
 
+		function decompressZIP( inDataView, offset, compressedSize, pixelType ) {
+
+			var raw;
+
+			var compressed = new Uint8Array( inDataView.buffer.slice( offset.value, offset.value + compressedSize ) );
+
+			if ( typeof Zlib === 'undefined' ) {
+
+				console.error( 'THREE.EXRLoader: External library Inflate.min.js required, obtain or import from https://github.com/imaya/zlib.js' );
+
+			}
+
+			var inflate = new Zlib.Inflate( compressed, { resize: true, verify: true } ); // eslint-disable-line no-undef
+
+			var rawBuffer = new Uint8Array( inflate.decompress().buffer );
+			var tmpBuffer = new Uint8Array( rawBuffer.length );
+			
+			reconstruct_scalar( rawBuffer ); // reorder pixels
+
+			interleave_scalar( rawBuffer, tmpBuffer ); // interleave pixels
+
+			if ( pixelType == 1 ) {
+
+				raw = new Uint16Array( tmpBuffer.buffer );
+
+			} else if ( pixelType == 2 ) {
+
+				raw = new Float32Array( tmpBuffer.buffer );
+
+			}
+			
+			return raw;
+
+		}
+
+		function reconstruct_scalar( source ) {
+
+			for ( let t = 1; t < source.length; t++ ) {
+
+				var d = source[ t-1 ] + source[ t ] - 128;
+				source[ t ] = d;
+
+			}
+
+		}
+
+		function interleave_scalar( source, out ) {
+
+			var t1 = 0;
+			var t2 = Math.floor( ( source.length + 1 ) / 2 );
+			var s = 0;
+			var stop = source.length - 1;
+
+			while ( true ) {
+
+				if ( s > stop ) break;
+				out[ s++ ] = source[ t1++ ];
+
+				if ( s > stop ) break;
+				out[ s++ ] = source[ t2++ ];
+
+			}
+
+		}
+
 		function parseNullTerminatedString( buffer, offset ) {
 
 			var uintBuffer = new Uint8Array( buffer );
@@ -1074,6 +1132,10 @@ THREE.EXRLoader.prototype = Object.assign( Object.create( THREE.DataTextureLoade
 
 			scanlineBlockSize = 32;
 
+		} else if ( EXRHeader.compression === 'ZIP_COMPRESSION' ) {
+
+			scanlineBlockSize = 16;
+
 		}
 
 		var numBlocks = dataWindowHeight / scanlineBlockSize;
@@ -1088,18 +1150,36 @@ THREE.EXRLoader.prototype = Object.assign( Object.create( THREE.DataTextureLoade
 
 		var width = EXRHeader.dataWindow.xMax - EXRHeader.dataWindow.xMin + 1;
 		var height = EXRHeader.dataWindow.yMax - EXRHeader.dataWindow.yMin + 1;
-		var numChannels = EXRHeader.channels.length;
+		// Firefox only supports RGBA (half) float textures
+		// var numChannels = EXRHeader.channels.length;
+		var numChannels = 4;
+		var size = width * height * numChannels;
 
+		// Fill initially with 1s for the alpha value if the texture is not RGBA, RGB values will be overwritten
 		switch ( this.type ) {
 
 			case THREE.FloatType:
 
-				var byteArray = new Float32Array( width * height * numChannels );
+				var byteArray = new Float32Array( size );
+
+				if ( EXRHeader.channels.length < numChannels ) {
+
+					byteArray.fill( 1, 0, size );
+
+				}
+
 				break;
 
 			case THREE.HalfFloatType:
 
-				var byteArray = new Uint16Array( width * height * numChannels );
+				var byteArray = new Uint16Array( size );
+
+				if ( EXRHeader.channels.length < numChannels ) {
+
+					byteArray.fill( 0x3C00, 0, size ); // Uint16Array holds half float data, 0x3C00 is 1
+
+				}
+
 				break;
 
 			default:
@@ -1151,7 +1231,7 @@ THREE.EXRLoader.prototype = Object.assign( Object.create( THREE.DataTextureLoade
 
 					} else {
 
-						throw 'EXRLoader._parser: unsupported pixelType ' + EXRHeader.channels[ channelID ].pixelType + '. Only pixelType is 1 (HALF) is supported.';
+						throw 'EXRLoader.parse: unsupported pixelType ' + EXRHeader.channels[ channelID ].pixelType + ' for ' + EXRHeader.compression + '.';
 
 					}
 
@@ -1170,7 +1250,7 @@ THREE.EXRLoader.prototype = Object.assign( Object.create( THREE.DataTextureLoade
 				var tmpBuffer = new Uint16Array( tmpBufferSize );
 				var tmpOffset = { value: 0 };
 
-				decompressPIZ( tmpBuffer, tmpOffset, uInt8Array, bufferDataView, offset, tmpBufferSize, numChannels, EXRHeader.channels, width, scanlineBlockSize );
+				decompressPIZ( tmpBuffer, tmpOffset, uInt8Array, bufferDataView, offset, tmpBufferSize, EXRHeader.channels.length, EXRHeader.channels, width, scanlineBlockSize );
 
 				for ( var line_y = 0; line_y < scanlineBlockSize; line_y ++ ) {
 
@@ -1206,7 +1286,7 @@ THREE.EXRLoader.prototype = Object.assign( Object.create( THREE.DataTextureLoade
 
 						} else {
 
-							throw 'EXRLoader._parser: unsupported pixelType ' + EXRHeader.channels[ channelID ].pixelType + '. Only pixelType is 1 (HALF) is supported.';
+							throw 'EXRLoader.parse: unsupported pixelType ' + EXRHeader.channels[ channelID ].pixelType + ' for ' + EXRHeader.compression + '.';
 
 						}
 
@@ -1216,9 +1296,79 @@ THREE.EXRLoader.prototype = Object.assign( Object.create( THREE.DataTextureLoade
 
 			}
 
+		} else if ( EXRHeader.compression === 'ZIP_COMPRESSION' || 
+					EXRHeader.compression === 'ZIPS_COMPRESSION' ) {
+
+			for ( var scanlineBlockIdx = 0; scanlineBlockIdx < height / scanlineBlockSize; scanlineBlockIdx ++ ) {
+
+				parseUint32( bufferDataView, offset ); // line_no
+				var compressedSize = parseUint32( bufferDataView, offset ); // data_len
+
+				var raw = decompressZIP( bufferDataView, offset, compressedSize, EXRHeader.channels[ 0 ].pixelType );
+
+				offset.value += compressedSize;
+				
+				for ( var line_y = 0; line_y < scanlineBlockSize; line_y ++ ) {
+
+					for ( var channelID = 0; channelID < EXRHeader.channels.length; channelID ++ ) {
+
+						for ( var x = 0; x < width; x ++ ) {
+
+							var cOff = channelOffsets[ EXRHeader.channels[ channelID ].name ];
+
+							var idx = ( line_y * ( EXRHeader.channels.length * width ) ) + ( channelID * width ) + x;
+
+							if ( EXRHeader.channels[ channelID ].pixelType === 1 ) { // half
+
+								switch ( this.type ) {
+
+									case THREE.FloatType:
+
+										var val = decodeFloat16( raw[ idx ] );
+										break;
+
+									case THREE.HalfFloatType:
+
+										var val = raw[ idx ];
+										break;
+
+								}
+
+							} else if ( EXRHeader.channels[ channelID ].pixelType === 2 ) { // float
+
+								switch ( this.type ) {
+
+									case THREE.FloatType:
+
+										var val = raw[ idx ];
+										break;
+
+									case THREE.HalfFloatType:
+
+										throw 'EXRLoader.parse: unsupported HalfFloatType texture for FloatType image file.'
+								}
+
+							} else {
+
+								throw 'EXRLoader.parse: unsupported pixelType ' + EXRHeader.channels[ channelID ].pixelType + ' for ' + EXRHeader.compression + '.';
+
+							}
+
+							var true_y = line_y + ( scanlineBlockIdx * scanlineBlockSize );
+
+							byteArray[ ( ( ( height - true_y ) * ( width * numChannels ) ) + ( x * numChannels ) ) + cOff ] = val;
+
+						}	
+
+					}
+
+				}
+
+			}
+
 		} else {
 
-			throw 'EXRLoader._parser: ' + EXRHeader.compression + ' is unsupported';
+			throw 'EXRLoader.parse: ' + EXRHeader.compression + ' is unsupported';
 
 		}
 
@@ -1227,9 +1377,50 @@ THREE.EXRLoader.prototype = Object.assign( Object.create( THREE.DataTextureLoade
 			width: width,
 			height: height,
 			data: byteArray,
-			format: EXRHeader.channels.length == 4 ? THREE.RGBAFormat : THREE.RGBFormat,
+			format: numChannels == 4 ? THREE.RGBAFormat : THREE.RGBFormat,
 			type: this.type
 		};
+
+	},
+
+	setDataType: function ( value ) {
+
+		this.type = value;
+		return this;
+
+	},
+
+	load: function ( url, onLoad, onProgress, onError ) {
+
+		function onLoadCallback( texture, texData ) {
+
+			switch ( texture.type ) {
+
+				case THREE.FloatType:
+
+					texture.encoding = THREE.LinearEncoding;
+					texture.minFilter = THREE.LinearFilter;
+					texture.magFilter = THREE.LinearFilter;
+					texture.generateMipmaps = false;
+					texture.flipY = false;
+					break;
+
+				case THREE.HalfFloatType:
+
+					texture.encoding = THREE.LinearEncoding;
+					texture.minFilter = THREE.LinearFilter;
+					texture.magFilter = THREE.LinearFilter;
+					texture.generateMipmaps = false;
+					texture.flipY = false;
+					break;
+
+			}
+
+			if ( onLoad ) onLoad( texture, texData );
+
+		}
+
+		return THREE.DataTextureLoader.prototype.load.call( this, url, onLoadCallback, onProgress, onError );
 
 	}
 
